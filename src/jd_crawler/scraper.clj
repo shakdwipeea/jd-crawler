@@ -1,5 +1,9 @@
 (ns jd-crawler.scraper
-  (:require [clojure.java.io :refer [as-url]])
+  (:require [clj-http.client :as client]
+            [clojure.string :as str]
+            [jd-crawler.html :refer [select* select-first]]
+            [jd-crawler.persist :as persist]
+            [net.cgrand.enlive-html :refer [attr?]])
   (:import org.apache.commons.validator.routines.UrlValidator))
 
 (require '[skyscraper :as scraper])
@@ -40,12 +44,6 @@
                      [:ul#sidebarnavleft :li :a])
                     process-home)))
 
-
-(scraper/scrape :seed :error-handler (fn [url error]
-                                       [{:context "Error occured at url %s and the status is %s"
-                                         :error-url url
-                                         :status (:status error)}]))
-
 ;; Options page
 (defn valid-url? [url-str]
   (let [validator (UrlValidator.)]
@@ -53,15 +51,18 @@
       url-str
       nil)))
 
+(defn emptyseq? [seq]
+  (if (empty? seq)
+    false
+    seq))
 
+;; so many or for desparately finding a text
 (defn process-options [opt-nodes]
   (map (fn [n]
-         {:url (valid-url? (scraper/href n)
-                )
-          :text (-> n
-                    (enlive/select [:span.meditle])
-                    first
-                    enlive/text)
+         {:url (valid-url? (scraper/href n))
+          :text (or (emptyseq? (select-first n [:span.meditle]))
+                    (emptyseq? (select-first n [:span.meditle1]))
+                    (scraper/href n))
           :processor :pathfinder}) opt-nodes))
 
 (scraper/defprocessor options-page
@@ -80,14 +81,17 @@
 ;; So we have set out to find its course. May the force be with us.
 
 (scraper/defprocessor pathfinder
-  :cache-template "path/:text"
+  :cache-template "path/:text/:url"
   :process-fn (fn [res context]
                 (println "finding path for " context)
                 (if (empty? (enlive/select res [:div#mnintrnlbnr :li :a]))
-                  (assoc context :processor :options-page)
-                  (merge context {:base-link (:url context)
-                                  :page "1"
-                                  :processor :results-page}))))
+                  (do (println "the path was results")
+                      (merge context {:base-link (:url context)
+                                      :page "1"
+                                      :text (:text context)
+                                      :processor :results-page}))
+                  (do (println "the path was options")
+                      (assoc context :processor :options-page)))))
 
 
 ;; Results page
@@ -102,39 +106,62 @@
    :url (scraper/href item)
    :processor :listing-page})
 
-(defn process-results [results {:keys [base-link page]}]
-  (let [context-list (map #(process-result-item %) results) ]
-    (when-not (empty? context-list)
-      (conj context-list {:page (str (inc (read-string page)))
-                          :url (append-to-link base-link (inc (read-string page)))
+
+
+(empty? '())
+
+(< 3 1)
+
+
+(defn ok [g ts hs]
+  [g ts hs])
+
+(apply ok 12 '(25 16))
+
+(defn process-results [{:keys [base-link page text]} listings next]
+  (let [context-list (map #(process-result-item %) listings)]
+    (println "sorry bu results are " (count listings))
+    (when-not (< (count context-list) 3)
+      (conj context-list {:text text
+                          :url (scraper/href next)
                           :processor :results-page}))))
 
 (scraper/defprocessor results-page
   :cache-template "result/:text/:page"
   :process-fn (fn [res {:keys [page text] :as context}]
                 (println "processing page " page " of " text)
-                (process-results
-                 (enlive/select res
-                                [:section.rslwrp :span.jcn :a])
-                 context)))
-
+                (apply process-results context (select* res
+                                                        [:section.rslwrp :span.jcn :a]
+                                                        [:div#srchpagination [:a (attr? :rel)] ]))))
 
 ;; Business Listing page 
-
 
 (scraper/defprocessor listing-page
   :cache-template "listing/:name"
   :process-fn (fn [res context]
                 (println "getting listing of " (:name context))
-                {:phones (map enlive/text (enlive/select
-                                           res
-                                           [:ul#comp-contact :div.telCntct :a]))
-                 :address (enlive/text (first (enlive/select
-                                               res
-                                               [:ul#comp-contact :span#fulladdress :span])))
-                 :name (enlive/text (first (enlive/select
-                                            res
-                                            [:div.company-details :span.fn])))}))
+                (let [listing {:phones (str/join "," (map
+                                                      enlive/text
+                                                      (enlive/select
+                                                       res
+                                                       [:ul#comp-contact :div.telCntct :a])))
+                               :address (-> res
+                                            (enlive/select
+                                             [:ul#comp-contact
+                                              :span#fulladdress
+                                              :span])
+                                            first
+                                            enlive/text)
+                               :name (-> res
+                                         (enlive/select
+                                          [:div.company-details :span.fn])
+                                         first
+                                         enlive/text)}]
+                  (persist/save-listing listing)
+                  listing)))
+
+
+
 
 ;; options url "https://www.justdial.com/Muzaffarpur/279/Anything-on-Hire_fil"
 ;; res-url "https://www.justdial.com/Muzaffarpur/Event-Organisers/nct-10194150"
@@ -145,15 +172,20 @@
 ;;     :base-link "https://www.justdial.com/Muzaffarpur/Car-Hire/nct-10076456"
 ;;     :page "1"}
 
+(println (client/get "https://www.justdial.com/Muzaffarpur/268/12559/Bottle-Feeding-Accessories_b2c/page-2"
+                     {:redirect-strategy :none
+                      :client-params {"http.protocol.allow-circular-redirects" false
+                                      "http.useragent" "Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/41.0.2228.0 Safari/537.36"}}))
+
 
 (defn seed [& _]
   [{:url "https://www.justdial.com"
     :processor :root-page}])
 
+(persist/clear-listing)
 
 (let [results (scraper/scrape (seed)
                               :processed-cache false
-                              :http-cache true
                               :error-handler :my-error-handler
-                              :retries 1)]
+                              :retries 2)]
   (spit "jd-data.json" (cheshire/generate-string results)))
